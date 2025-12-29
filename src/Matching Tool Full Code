@@ -1,0 +1,303 @@
+/*******************************************************
+ * FULLCODE.gs — Public-safe Google Apps Script template
+ * Spreadsheet matching tool (generic, non-proprietary).
+ *******************************************************/
+
+/* =========================
+ * CONFIG
+ * ========================= */
+const CONFIG = {
+  // If null, uses the active spreadsheet where the script is attached.
+  SPREADSHEET_ID: null,
+
+  // Source tabs
+  TAB_A: "SOURCE_A",
+  TAB_B: "SOURCE_B",
+
+  // Output tab
+  OUTPUT_TAB: "MATCH_RESULTS",
+
+  // Expected headers in Source A
+  A_HEADERS: {
+    ID: "Record ID",
+    AMOUNT: "Amount",
+    DATE: "Date",
+    REF: "Reference",
+  },
+
+  // Expected headers in Source B
+  B_HEADERS: {
+    ID: "Txn ID",
+    AMOUNT: "Amount",
+    DATE: "Date",
+    REF: "Memo",
+  },
+
+  // Matching rules
+  RULES: {
+    AMOUNT_TOLERANCE: 0.00,         // exact match by default
+    MAX_DATE_DISTANCE_DAYS: 7,      // allow +- N days
+    MIN_SCORE_TO_MATCH: 70,         // 0-100
+    REQUIRE_AMOUNT_PRESENT: true,   // if true, requires amount on both sides for a match
+  },
+};
+
+/* =========================
+ * LOGGER
+ * ========================= */
+function logInfo(message, data) {
+  if (data !== undefined) console.log(`[INFO] ${message}`, data);
+  else console.log(`[INFO] ${message}`);
+}
+function logWarn(message, data) {
+  if (data !== undefined) console.warn(`[WARN] ${message}`, data);
+  else console.warn(`[WARN] ${message}`);
+}
+function logError(message, data) {
+  if (data !== undefined) console.error(`[ERROR] ${message}`, data);
+  else console.error(`[ERROR] ${message}`);
+}
+
+/* =========================
+ * SHEETS IO
+ * ========================= */
+function getSpreadsheet_() {
+  if (CONFIG.SPREADSHEET_ID) return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function getOrCreateSheet_(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+/**
+ * Reads a sheet as a table using the first row as headers.
+ * Returns:
+ * - rows: array of row arrays (excluding header)
+ * - headerIndex: map {headerName -> colIndex}
+ */
+function readTableByHeaders_(sheet, requiredHeadersMap) {
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length === 0) return { rows: [], headerIndex: {} };
+
+  const headers = values[0].map((h) => String(h).trim());
+  const headerIndex = {};
+  headers.forEach((h, i) => (headerIndex[h] = i));
+
+  // Validate required headers exist
+  Object.keys(requiredHeadersMap).forEach((k) => {
+    const headerName = requiredHeadersMap[k];
+    if (headerIndex[headerName] === undefined) {
+      throw new Error(`Missing required header "${headerName}" in sheet "${sheet.getName()}".`);
+    }
+  });
+
+  const rows = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    // Skip fully empty rows
+    if (row.every((c) => c === "" || c === null)) continue;
+    rows.push(row);
+  }
+
+  return { rows, headerIndex };
+}
+
+function writeResults_(sheet, headers, rows) {
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows.length) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+/* =========================
+ * MATCH ENGINE
+ * ========================= */
+function normalizeAmount_(v) {
+  if (v === null || v === "") return null;
+  const n = typeof v === "number" ? v : Number(String(v).replace(/[^0-9.\-]/g, ""));
+  return isFinite(n) ? Math.round(n * 100) / 100 : null;
+}
+
+function normalizeDate_(v) {
+  if (!v) return null;
+  if (v instanceof Date) return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function tokenize_(s) {
+  if (!s) return [];
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function jaccard_(aTokens, bTokens) {
+  const a = new Set(aTokens);
+  const b = new Set(bTokens);
+  if (!a.size && !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  const union = a.size + b.size - inter;
+  return union ? inter / union : 0;
+}
+
+function dateDistanceDays_(a, b) {
+  if (!a || !b) return Infinity;
+  const ms = Math.abs(a.getTime() - b.getTime());
+  return Math.floor(ms / (1000 * 60 * 60 * 24));
+}
+
+/**
+ * Score a candidate match. Returns 0-100.
+ * Weighted: amount (0-50), date (0-30), reference similarity (0-20).
+ */
+function scoreMatch_(a, b) {
+  const amountA = a.amount;
+  const amountB = b.amount;
+  const dateA = a.date;
+  const dateB = b.date;
+
+  // Amount score
+  let amountScore = 0;
+  if (amountA !== null && amountB !== null) {
+    const diff = Math.abs(amountA - amountB);
+    amountScore = diff <= CONFIG.RULES.AMOUNT_TOLERANCE ? 50 : Math.max(0, 50 - diff * 10);
+  } else if (CONFIG.RULES.REQUIRE_AMOUNT_PRESENT) {
+    amountScore = 0;
+  }
+
+  // Date score
+  const days = dateDistanceDays_(dateA, dateB);
+  const dateScore =
+    days <= CONFIG.RULES.MAX_DATE_DISTANCE_DAYS ? Math.max(0, 30 - days * 3) : 0;
+
+  // Reference similarity score
+  const refScore = Math.round(jaccard_(a.tokens, b.tokens) * 20);
+
+  return amountScore + dateScore + refScore; // max 100
+}
+
+function matchRecords_(aRecords, bRecords) {
+  // Index B by amount for speed (fallback to all records if amount missing)
+  const bByAmount = new Map();
+  for (const b of bRecords) {
+    const key = b.amount === null ? "null" : String(b.amount);
+    if (!bByAmount.has(key)) bByAmount.set(key, []);
+    bByAmount.get(key).push(b);
+  }
+
+  const matches = [];
+  const usedB = new Set();
+
+  for (const a of aRecords) {
+    const key = a.amount === null ? "null" : String(a.amount);
+    const pool = bByAmount.get(key) || bRecords;
+
+    // Filter out B already used
+    const candidates = pool.filter((b) => !usedB.has(b._idx));
+
+    let best = null;
+    for (const b of candidates) {
+      // If amount is required and missing on either side, score will be low anyway,
+      // but we can short-circuit here if desired.
+      const score = scoreMatch_(a, b);
+      if (!best || score > best.score) best = { b, score };
+    }
+
+    if (best && best.score >= CONFIG.RULES.MIN_SCORE_TO_MATCH) {
+      usedB.add(best.b._idx);
+      matches.push({ a, b: best.b, score: best.score, status: "MATCHED" });
+    } else {
+      matches.push({ a, b: null, score: best ? best.score : 0, status: "NO_MATCH" });
+    }
+  }
+
+  return matches;
+}
+
+/* =========================
+ * ENTRY POINT
+ * ========================= */
+/**
+ * Entry point — run manually from the Apps Script editor.
+ *
+ * Expected setup:
+ * - Google Sheet has tabs: SOURCE_A and SOURCE_B (customizable in CONFIG)
+ * - Each tab has headers in row 1:
+ *   SOURCE_A: Record ID | Amount | Date | Reference
+ *   SOURCE_B: Txn ID    | Amount | Date | Memo
+ *
+ * Output:
+ * - Writes MATCH_RESULTS with one row per record in SOURCE_A
+ */
+function runMatching() {
+  const ss = getSpreadsheet_();
+
+  const sheetA = ss.getSheetByName(CONFIG.TAB_A);
+  const sheetB = ss.getSheetByName(CONFIG.TAB_B);
+  if (!sheetA || !sheetB) {
+    throw new Error(`Missing source tabs. Expected "${CONFIG.TAB_A}" and "${CONFIG.TAB_B}".`);
+  }
+
+  const aTable = readTableByHeaders_(sheetA, CONFIG.A_HEADERS);
+  const bTable = readTableByHeaders_(sheetB, CONFIG.B_HEADERS);
+
+  const aRecs = aTable.rows.map((row, i) => ({
+    _idx: i,
+    id: row[aTable.headerIndex[CONFIG.A_HEADERS.ID]],
+    amount: normalizeAmount_(row[aTable.headerIndex[CONFIG.A_HEADERS.AMOUNT]]),
+    date: normalizeDate_(row[aTable.headerIndex[CONFIG.A_HEADERS.DATE]]),
+    ref: row[aTable.headerIndex[CONFIG.A_HEADERS.REF]],
+    tokens: tokenize_(row[aTable.headerIndex[CONFIG.A_HEADERS.REF]]),
+    raw: row,
+  }));
+
+  const bRecs = bTable.rows.map((row, i) => ({
+    _idx: i,
+    id: row[bTable.headerIndex[CONFIG.B_HEADERS.ID]],
+    amount: normalizeAmount_(row[bTable.headerIndex[CONFIG.B_HEADERS.AMOUNT]]),
+    date: normalizeDate_(row[bTable.headerIndex[CONFIG.B_HEADERS.DATE]]),
+    ref: row[bTable.headerIndex[CONFIG.B_HEADERS.REF]],
+    tokens: tokenize_(row[bTable.headerIndex[CONFIG.B_HEADERS.REF]]),
+    raw: row,
+  }));
+
+  logInfo("Loaded records", { sourceA: aRecs.length, sourceB: bRecs.length });
+
+  const results = matchRecords_(aRecs, bRecs);
+
+  const out = getOrCreateSheet_(ss, CONFIG.OUTPUT_TAB);
+  const headers = [
+    "A_ID",
+    "A_AMOUNT",
+    "A_DATE",
+    "A_REF",
+    "STATUS",
+    "SCORE",
+    "B_ID",
+    "B_AMOUNT",
+    "B_DATE",
+    "B_REF",
+  ];
+
+  const rows = results.map((r) => [
+    r.a.id,
+    r.a.amount,
+    r.a.date,
+    r.a.ref,
+    r.status,
+    r.score,
+    r.b ? r.b.id : "",
+    r.b ? r.b.amount : "",
+    r.b ? r.b.date : "",
+    r.b ? r.b.ref : "",
+  ]);
+
+  writeResults_(out, headers, rows);
+  logInfo("Done. Wrote results to output tab", CONFIG.OUTPUT_TAB);
+}

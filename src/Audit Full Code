@@ -1,0 +1,375 @@
+/* =========================
+ * CONFIG
+ * ========================= */
+const CONFIG = {
+  SPREADSHEET_ID: null, // null => active spreadsheet
+
+  TABS: {
+    SOURCE_A: "SOURCE_A",          // e.g., bank transactions
+    SOURCE_B: "SOURCE_B",          // e.g., checks ledger
+    OUTPUT: "AUDIT_OUTPUT",        // output report
+    LOOKUP: "LOOKUP",              // optional third tab (for enrichment)
+  },
+
+  // Required headers (exact text) in each tab
+  HEADERS_A: {
+    DATE: "Date",
+    TYPE: "Type",
+    AMOUNT: "Amount",
+    REF: "Reference",
+  },
+  HEADERS_B: {
+    DATE: "Date",
+    AMOUNT: "Amount",
+    REF: "Reference",
+    KEY: "Key", // optional, only needed if you use enrichment lookup
+  },
+
+  // Optional lookup tab headers (only used if ENRICHMENT.ENABLED = true)
+  LOOKUP_HEADERS: {
+    KEY: "Key",
+    EXTRA: "Extra Field", // e.g., "Date Deposited"
+  },
+
+  FILTERS: {
+    // Date range filter applied to Source A (and optionally Source B)
+    START_DATE: "2025-01-01", // YYYY-MM-DD
+    END_DATE: "2025-12-31",   // YYYY-MM-DD (inclusive)
+    APPLY_DATE_FILTER_TO_B: false,
+
+    // Optional allowlist filter on Source A type
+    TYPE_ALLOWLIST: ["Deposit", "Credit"], // set [] to disable type filter
+  },
+
+  MATCHING: {
+    // Exact match on cents (two decimals). No ABS, no rounding beyond cents.
+    AMOUNT_DECIMALS: 2,
+  },
+
+  ENRICHMENT: {
+    ENABLED: false, // set true to enrich missing list with lookup EXTRA field
+    TARGET_LIST: "B_MISSING_ON_A", // or "A_MISSING_ON_B"
+  },
+};
+
+/* =========================
+ * ENTRY POINT
+ * ========================= */
+function runAuditTemplate() {
+  const ss = getSpreadsheet_();
+  const shA = requireSheet_(ss, CONFIG.TABS.SOURCE_A);
+  const shB = requireSheet_(ss, CONFIG.TABS.SOURCE_B);
+  const out = getOrCreateSheet_(ss, CONFIG.TABS.OUTPUT);
+
+  const a = readTableByHeaders_(shA, CONFIG.HEADERS_A);
+  const b = readTableByHeaders_(shB, CONFIG.HEADERS_B);
+
+  const start = parseYMD_(CONFIG.FILTERS.START_DATE);
+  const end = parseYMD_(CONFIG.FILTERS.END_DATE);
+
+  const aRecs = buildRecordsA_(a, start, end);
+  const bRecs = buildRecordsB_(b, start, end);
+
+  // Totals
+  const totalA = sumAmounts_(aRecs.map(r => r.amountCents));
+  const totalB = sumAmounts_(bRecs.map(r => r.amountCents));
+  const diff = totalA - totalB;
+
+  // Missing lists via multiset matching on amount cents
+  const aMissingOnB = computeMissing_(aRecs, bRecs); // items in A not found in B
+  const bMissingOnA = computeMissing_(bRecs, aRecs); // items in B not found in A
+
+  // Optional enrichment
+  let enriched = null;
+  if (CONFIG.ENRICHMENT.ENABLED) {
+    const lookupSheet = requireSheet_(ss, CONFIG.TABS.LOOKUP);
+    const lookup = readTableByHeaders_(lookupSheet, CONFIG.LOOKUP_HEADERS);
+    const map = buildLookupMap_(lookup, CONFIG.LOOKUP_HEADERS.KEY, CONFIG.LOOKUP_HEADERS.EXTRA);
+
+    if (CONFIG.ENRICHMENT.TARGET_LIST === "A_MISSING_ON_B") {
+      enriched = enrichList_(aMissingOnB, map);
+    } else {
+      enriched = enrichList_(bMissingOnA, map);
+    }
+  }
+
+  // Render report
+  renderAuditReport_(out, {
+    start,
+    end,
+    totalA,
+    totalB,
+    diff,
+    aMissingOnB,
+    bMissingOnA,
+    enrichment: enriched,
+  });
+}
+
+/* =========================
+ * BUILD RECORDS
+ * ========================= */
+
+function buildRecordsA_(table, start, end) {
+  const rows = table.rows;
+  const idx = table.headerIndex;
+
+  const typeAllow = Array.isArray(CONFIG.FILTERS.TYPE_ALLOWLIST) ? CONFIG.FILTERS.TYPE_ALLOWLIST : [];
+  const useTypeFilter = typeAllow.length > 0;
+
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const date = normalizeDate_(r[idx[CONFIG.HEADERS_A.DATE]]);
+    const type = String(r[idx[CONFIG.HEADERS_A.TYPE]] || "").trim();
+    const amountCents = toCents_(r[idx[CONFIG.HEADERS_A.AMOUNT]]);
+    const ref = String(r[idx[CONFIG.HEADERS_A.REF]] || "").trim();
+
+    if (!date || amountCents === null) continue;
+    if (!inRangeInclusive_(date, start, end)) continue;
+    if (useTypeFilter && !typeAllow.includes(type)) continue;
+
+    out.push({
+      source: "A",
+      rowIndex: i + 2, // +2 because sheet row = header(1) + data row index
+      date,
+      type,
+      amountCents,
+      ref,
+      key: null,
+    });
+  }
+  return out;
+}
+
+function buildRecordsB_(table, start, end) {
+  const rows = table.rows;
+  const idx = table.headerIndex;
+
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const date = normalizeDate_(r[idx[CONFIG.HEADERS_B.DATE]]);
+    const amountCents = toCents_(r[idx[CONFIG.HEADERS_B.AMOUNT]]);
+    const ref = String(r[idx[CONFIG.HEADERS_B.REF]] || "").trim();
+    const key = (idx[CONFIG.HEADERS_B.KEY] !== undefined)
+      ? String(r[idx[CONFIG.HEADERS_B.KEY]] || "").trim()
+      : "";
+
+    if (!date || amountCents === null) continue;
+    if (CONFIG.FILTERS.APPLY_DATE_FILTER_TO_B && !inRangeInclusive_(date, start, end)) continue;
+
+    out.push({
+      source: "B",
+      rowIndex: i + 2,
+      date,
+      type: "",
+      amountCents,
+      ref,
+      key,
+    });
+  }
+  return out;
+}
+
+/* =========================
+ * MISSING LISTS (multiset exact match on cents)
+ * ========================= */
+
+/**
+ * Returns items from left that cannot be matched to right by amountCents.
+ * Uses multiset logic: if right has N occurrences of a given amount,
+ * it can match at most N items from left.
+ */
+function computeMissing_(left, right) {
+  const rightCounts = new Map();
+  for (const r of right) {
+    const k = String(r.amountCents);
+    rightCounts.set(k, (rightCounts.get(k) || 0) + 1);
+  }
+
+  const missing = [];
+  for (const l of left) {
+    const k = String(l.amountCents);
+    const c = rightCounts.get(k) || 0;
+    if (c > 0) {
+      rightCounts.set(k, c - 1);
+    } else {
+      missing.push(l);
+    }
+  }
+  return missing;
+}
+
+/* =========================
+ * OPTIONAL ENRICHMENT (lookup by key)
+ * ========================= */
+
+function buildLookupMap_(lookupTable, keyHeaderName, extraHeaderName) {
+  const rows = lookupTable.rows;
+  const idx = lookupTable.headerIndex;
+
+  const map = new Map();
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const key = String(r[idx[keyHeaderName]] || "").trim();
+    const extra = r[idx[extraHeaderName]];
+    if (!key) continue;
+    if (!map.has(key)) map.set(key, extra);
+  }
+  return map;
+}
+
+function enrichList_(list, lookupMap) {
+  return list.map(item => ({
+    ...item,
+    extra: item.key ? (lookupMap.has(item.key) ? lookupMap.get(item.key) : "Not Found") : "No Key",
+  }));
+}
+
+/* =========================
+ * OUTPUT RENDERING
+ * ========================= */
+
+function renderAuditReport_(sheet, data) {
+  sheet.clearContents();
+
+  const lines = [];
+  lines.push(["Audit / Reconciliation Report (Template)"]);
+  lines.push(["Date Range", formatYMD_(data.start) + " to " + formatYMD_(data.end)]);
+  lines.push(["Total A", fromCents_(data.totalA)]);
+  lines.push(["Total B", fromCents_(data.totalB)]);
+  lines.push(["Difference (A - B)", fromCents_(data.diff)]);
+  lines.push([""]); // spacer
+
+  // Section A missing on B
+  lines.push(["A Missing on B (exact amount match)"]);
+  lines.push(["Row", "Date", "Type", "Amount", "Reference"]);
+  for (const r of data.aMissingOnB) {
+    lines.push([r.rowIndex, formatYMD_(r.date), r.type, fromCents_(r.amountCents), r.ref]);
+  }
+  lines.push([""]); // spacer
+
+  // Section B missing on A
+  lines.push(["B Missing on A (exact amount match)"]);
+  lines.push(["Row", "Date", "Amount", "Reference", "Key"]);
+  for (const r of data.bMissingOnA) {
+    lines.push([r.rowIndex, formatYMD_(r.date), fromCents_(r.amountCents), r.ref, r.key]);
+  }
+
+  // Optional enriched section
+  if (data.enrichment) {
+    lines.push([""]); // spacer
+    lines.push([`Enrichment (${CONFIG.ENRICHMENT.TARGET_LIST})`]);
+    lines.push(["Row", "Date", "Amount", "Reference", "Key", "Extra"]);
+    for (const r of data.enrichment) {
+      lines.push([r.rowIndex, formatYMD_(r.date), fromCents_(r.amountCents), r.ref, r.key, r.extra]);
+    }
+  }
+
+  // Write to sheet
+  const maxCols = lines.reduce((m, row) => Math.max(m, row.length), 1);
+  const normalized = lines.map(row => {
+    const out = row.slice();
+    while (out.length < maxCols) out.push("");
+    return out;
+  });
+
+  sheet.getRange(1, 1, normalized.length, maxCols).setValues(normalized);
+
+  // Basic formatting
+  sheet.autoResizeColumns(1, Math.min(maxCols, 10));
+}
+
+/* =========================
+ * HELPERS
+ * ========================= */
+
+function getSpreadsheet_() {
+  return CONFIG.SPREADSHEET_ID
+    ? SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+    : SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function requireSheet_(ss, name) {
+  const sh = ss.getSheetByName(name);
+  if (!sh) throw new Error(`Missing sheet/tab: "${name}"`);
+  return sh;
+}
+
+function getOrCreateSheet_(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function readTableByHeaders_(sheet, requiredHeadersMap) {
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length === 0) return { rows: [], headerIndex: {} };
+
+  const headers = values[0].map(h => String(h).trim());
+  const headerIndex = {};
+  headers.forEach((h, i) => (headerIndex[h] = i));
+
+  Object.keys(requiredHeadersMap).forEach((k) => {
+    const headerName = requiredHeadersMap[k];
+    if (headerIndex[headerName] === undefined) {
+      throw new Error(`Missing required header "${headerName}" in sheet "${sheet.getName()}".`);
+    }
+  });
+
+  const rows = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (row.every(c => c === "" || c === null)) continue;
+    rows.push(row);
+  }
+  return { rows, headerIndex };
+}
+
+function parseYMD_(s) {
+  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) throw new Error(`Invalid date format (expected YYYY-MM-DD): ${s}`);
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function formatYMD_(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function normalizeDate_(v) {
+  if (!v) return null;
+  if (v instanceof Date) return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return null;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function inRangeInclusive_(d, start, end) {
+  const t = d.getTime();
+  return t >= start.getTime() && t <= end.getTime();
+}
+
+function toCents_(v) {
+  if (v === null || v === "") return null;
+  const n = (typeof v === "number") ? v : Number(String(v).replace(/[^0-9.\-]/g, ""));
+  if (!isFinite(n)) return null;
+  const factor = Math.pow(10, CONFIG.MATCHING.AMOUNT_DECIMALS);
+  // exact on cents: normalize to integer cents
+  return Math.trunc(n * factor);
+}
+
+function fromCents_(c) {
+  if (c === null || c === undefined || !isFinite(c)) return "";
+  const factor = Math.pow(10, CONFIG.MATCHING.AMOUNT_DECIMALS);
+  const n = c / factor;
+  // keep it readable in Sheets
+  return Number(n.toFixed(CONFIG.MATCHING.AMOUNT_DECIMALS));
+}
+
+function sumAmounts_(centsArray) {
+  let s = 0;
+  for (const c of centsArray) if (c !== null && isFinite(c)) s += c;
+  return s;
+}
